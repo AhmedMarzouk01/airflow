@@ -1,24 +1,70 @@
-COVID-19 Analytics Pipeline Using Apache Airflow
-Project Overview
-This project automates the ETL process for COVID-19 case data from Johns Hopkins University's (JHU) GitHub repository. The pipeline extracts, transforms, and loads (ETL) data into a structured SQL Server database for further analysis. Apache Airflow orchestrates the workflow.
+#COVID-19 Data Pipeline with Apache Airflow 🚀
+#Automated Data Processing Pipeline for COVID-19 Case Data
+#Extract | Transform | Load | Analyze
 
-The pipeline successfully fetches and processes over 4 million rows of COVID-19 case data, ensuring structured and clean data storage.
+📌 Project Overview
+The COVID-19 Data Pipeline is an Apache Airflow-powered ETL workflow that automates the process of fetching, cleaning, and loading global COVID-19 case data from Johns Hopkins University (JHU) into a Microsoft SQL Server database for further analysis.
 
-Tech Stack
-Orchestration: Apache Airflow
+This project demonstrates how to efficiently process over 4 million rows of pandemic data, handling missing values, data inconsistencies, and database optimization while ensuring the dataset is structured for analytical use.
 
-Data Extraction: requests (Python)
+⚡ Key Features:
+✅ Automated Data Fetching: Downloads JHU’s daily COVID-19 reports directly from GitHub.
+✅ Scalable ETL Pipeline: Processes large datasets efficiently using Airflow’s DAGs.
+✅ Data Cleaning & Transformation: Standardizes country names, removes null values, and ensures consistency.
+✅ Database Optimization: Implements dimensional modeling for efficient querying.
+✅ Robust Error Handling: Skips missing files, logs errors, and maintains data integrity.
 
-Data Processing: pandas
-
-Database: Microsoft SQL Server
-
-Database ORM: SQLAlchemy
-
-Programming Language: Python
-
-Project Structure
+📊 Project Architecture
+🔁 Workflow of the Airflow DAG
 pgsql
+Copy
+Edit
+            +--------------------------+
+            | Start DAG Execution       |
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | Create Database Schema    |
+            | (Tables & Constraints)    |
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | Fetch Data from GitHub    |
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | Clean & Transform Data    |
+            | (Standardize, Handle NULLs)|
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | Load into SQL Server      |
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | Update Facts Table        |
+            | (Ensure Data Consistency) |
+            +-----------+--------------+
+                        |
+                        v
+            +--------------------------+
+            | DAG Execution Complete    |
+            +--------------------------+
+🛠️ Tech Stack & Tools
+Category	Technology Used
+Orchestration	Apache Airflow
+Data Extraction	Python (requests, pandas)
+Database	Microsoft SQL Server
+Database ORM	SQLAlchemy
+Programming Language	Python
+Task Scheduling	Airflow DAGs
+📂 Project Structure
+plaintext
 Copy
 Edit
 Covid19-Airflow-Pipeline/
@@ -31,41 +77,37 @@ Covid19-Airflow-Pipeline/
 │-- README.md  # Project documentation
 │-- requirements.txt  # Required Python packages
 │-- .gitignore  # Git ignored files
-Pipeline Workflow
-The DAG executes the following steps:
+📝 Detailed ETL Process
+1️⃣ Database Schema Creation (SCHEMA_SQL)
+Creates three tables:
 
-Database Schema Creation (SCHEMA_SQL)
+dim_date → Stores unique dates
 
-Creates three tables: dim_date, dim_location, and fact_covid_cases if they do not already exist.
+dim_location → Stores unique locations with latitude & longitude
 
-Extract Data (fetch_data)
+fact_covid_cases → Stores daily case counts
 
-Downloads the COVID-19 daily reports from JHU's GitHub repository.
+2️⃣ Data Extraction (fetch_data)
+Pulls the latest COVID-19 reports from JHU's GitHub repository.
 
-Handles missing files by skipping execution on unavailable dates.
+Handles missing files and skips execution when necessary.
 
-Processes over 4 million rows across historical datasets.
+Fetches & processes over 4 million rows of historical pandemic data.
 
-Transform Data (clean_transform_data)
+3️⃣ Data Transformation (clean_transform_data)
+Standardizes column names for consistency.
 
-Standardizes column names.
+Handles missing values & incorrect data types.
 
-Handles missing values and incorrect data formats.
+Maps country names for consistency in reports.
 
-Maps country names to ensure consistency.
+4️⃣ Load Dimension Tables (load_dimensions)
+Date dimension (dim_date) → Inserts unique date values.
 
-Load Dimension Tables (load_dimensions)
+Location dimension (dim_location) → Handles duplicates and missing coordinates.
 
-Inserts unique date values into dim_date.
+5️⃣ Load Fact Table (load_facts)
+Ensures data integrity before inserting records into fact_covid_cases.
 
-Inserts unique locations into dim_location, handling duplicates and missing coordinates.
-
-Load Fact Table (load_facts)
-
-Joins data with dim_date and dim_location.
-
-Inserts new records into fact_covid_cases.
-
-Updates existing records if case counts have changed.
-
+Updates existing records if new case counts are reported.
 
