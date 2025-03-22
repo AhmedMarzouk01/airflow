@@ -1,0 +1,564 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.microsoft.mssql.operators.mssql import MsSqlOperator
+from airflow.exceptions import AirflowSkipException
+from datetime import datetime, timedelta
+import pandas as pd
+import requests
+from io import StringIO
+from sqlalchemy import create_engine, text,MetaData,Table,Column, Integer, String, DECIMAL
+
+default_args = {
+    'owner':'Ahmed',
+    'depends_on_past': False,
+    'start_date': datetime(2020,1,20),
+    'end_date': datetime(2023, 3, 30),  # Add this line
+    'retries':3,
+    'retry_delay': timedelta(minutes=5),
+    'max_active_tasks': 1,
+}
+
+MSSQL_CONN_STR = (
+    "mssql+pyodbc://airflow_user:5658545212@"
+    "192.168.1.6\\SQLEXPRESS/Covid2?"
+    "driver=ODBC+Driver+18+for+SQL+Server&"
+    "TrustServerCertificate=yes&"
+    "Encrypt=no&"
+    "autocommit=True&"
+    "fast_executemany=True"
+)
+
+
+
+JHU_BASE_URL = "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_daily_reports/"
+COUNTRY_MAPPING = {
+    'US': 'United States',
+    'USA': 'United States',
+    'Korea, South': 'South Korea',
+    'UK': 'United Kingdom',
+    'Russian Federation' : 'Russia',
+    'Mainland China' : 'China',
+    'Republic Of Korea' : 'South Korea',
+    'Iran (Islamic Republic Of)' : 'Iran',
+    'Bahamas, The' : 'Bahamas',
+    'Korea, North' : 'North Korea',
+    'Czechia' : 'Czech Republic',
+    'Dominican Republic' : 'Dominica',
+    'Gambia, The' : 'Gambia',
+    'Hong Kong Sar' : 'Hong Kong',
+    'Macao Sar' : 'Macau',
+    'Occupied Palestinian Territory' : 'Palestine',
+    'Republic Of Ireland' : 'Ireland',
+    'Taiwan*' :'Taiwan',
+    'The Bahamas' : 'Bahamas',
+    'The Gambia' : 'Gambia',
+    'Viet Nam' : 'Vietnam',
+    'West Bank And Gaza' : 'Palestine'
+
+}
+
+SCHEMA_SQL = """
+USE Covid;  -- Ensure we're in the correct database
+
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'dim_date' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+    CREATE TABLE dbo.dim_date (
+        date_id INT IDENTITY(1,1) PRIMARY KEY,
+        full_date DATE NOT NULL UNIQUE,
+        day INT NOT NULL,
+        month INT NOT NULL,
+        year INT NOT NULL,
+        week_of_year INT NOT NULL
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'dim_location' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+    CREATE TABLE dbo.dim_location (
+        location_id INT IDENTITY(1,1) PRIMARY KEY,
+        country VARCHAR(255) NOT NULL,
+        lat DECIMAL(9,6) NULL,
+        long DECIMAL(9,6) NULL,
+        CONSTRAINT UQ_location UNIQUE (country, province)
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'fact_covid_cases' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+    CREATE TABLE dbo.fact_covid_cases (
+        case_id INT IDENTITY(1,1) PRIMARY KEY,
+        date_id INT NOT NULL,
+        location_id INT NOT NULL,
+        confirmed INT CHECK (confirmed >= 0),
+        deaths INT CHECK (deaths >= 0),
+        recovered INT CHECK (recovered >= 0),
+        FOREIGN KEY (date_id) REFERENCES dbo.dim_date(date_id),
+        FOREIGN KEY (location_id) REFERENCES dbo.dim_location(location_id)
+    );
+END
+"""
+
+def standarize_column_names(df):
+
+        column_map = {
+        'Province/State': 'province',
+        'Country/Region': 'country',
+        'Country_Region': 'country',
+        'Last Update': 'Last_Update',
+        'Last_Update': 'Last_Update',
+        'Latitude': 'lat',
+        'Lat': 'lat',
+        'Longitude': 'long',
+        'Long_': 'long',
+        'Confirmed': 'Confirmed',
+        'Deaths': 'Deaths',
+        'Recovered': 'Recovered'
+    }
+
+        df = df.rename(columns = {k :v for k,v in column_map.items() if k in df.columns})
+
+        if 'province' not in df.columns and 'Combined_Key' in df.columns:
+
+                df['province'] = df['Combined_Key'].str.split(', ').str[-2]
+
+        if 'lat' not in df.columns:
+                df['lat'] = 0.0
+        if 'long' not in df.columns:
+                df['long'] = 0.0
+
+
+        return df
+
+         
+
+
+
+def fetch_data(**context):
+        execution_date = context['execution_date']
+        date_str = execution_date.strftime("%m-%d-%Y")
+
+        try:
+                jhu_url = f"{JHU_BASE_URL}{date_str}.csv"
+                response = requests.get(jhu_url,timeout = 30)
+
+                if response.status_code == 404:
+                        raise AirflowSkipException(f"No Jhu data for {date_str}")
+                response.raise_for_status()
+
+                jhu_df = pd.read_csv(StringIO(response.text))
+
+                return jhu_df.to_json()
+                
+               
+        except Exception as e:
+                context['ti'].log.error(f"Failed to fetch data: {str(e)}")
+                raise
+
+def clean_transform_data(**context):
+        ti = context['ti']
+        raw_data = ti.xcom_pull(task_ids = 'fetch_data')
+
+        if not raw_data:
+                raise AirflowSkipException("no data")
+
+        df = pd.read_json(raw_data)
+        df = standarize_column_names(df)
+
+     
+
+        
+
+        df['date']=pd.to_datetime(df['Last_Update'],errors='coerce')
+        df=df.dropna(subset=['date'])
+        
+        df['country'] = df['country'].replace(COUNTRY_MAPPING)
+
+        df['country'] = df['country'].str.strip().str.title().str.replace(' Of ', ' of ')
+        df['province'] = df['province'].str.strip().str.title().str.replace(' Of ', ' of ')
+
+        df['country'] = df['country'].fillna('unknown')
+        df['country'] = df['country'].replace('', 'unknown')
+
+        df['province'] = df['province'].replace('', 'unknown')
+
+        df['province'] = df['province'].fillna('unknown')
+
+
+        metrics = ['Confirmed', 'Deaths', 'Recovered']
+
+        df[metrics] = df[metrics].fillna(0).clip(lower = 0)
+
+        location_columns= ['lat','long']
+        
+        for col in location_columns:
+                if col not in df.columns:
+                        context['ti'].log.warning(f"creating missing columns: {col}")
+                        df[col] = 0.0
+        df[location_columns] = df[location_columns].astype(float)
+
+        df[location_columns] = df[location_columns].fillna(0)
+
+        df['lat'] = df['lat'].clip(-90, 90)
+        df['long'] = df['long'].clip(-180, 180)
+
+        clean_df = df[['date', 'country', 'province', 'lat', 'long', 'Confirmed', 'Deaths', 'Recovered']]
+
+        return clean_df.to_json(date_format='iso')
+
+def load_dimensions(**context):
+        ti = context['ti']
+        engine = create_engine(MSSQL_CONN_STR,fast_executemany=False)
+
+        clean_data = ti.xcom_pull(task_ids = 'clean_transform_data')
+
+        if not clean_data:
+                raise AirflowSkipException('no clean data')
+
+        df = pd.read_json(clean_data)
+
+        df['full_date'] = pd.to_datetime(df['date']).dt.date
+        dates = df[['full_date']].drop_duplicates()
+
+        dates['full_date_dt']= pd.to_datetime(dates['full_date'])
+        dates['day'] = dates['full_date_dt'].dt.day
+        dates['month'] = dates['full_date_dt'].dt.month
+        dates['year'] = dates['full_date_dt'].dt.year
+        dates['week_of_year'] = dates['full_date_dt'].dt.isocalendar().week
+        
+        
+        date_records = dates[['full_date','day','month','year','week_of_year']]
+
+        
+
+        with engine.begin() as connection:
+
+                connection.execute(text("CREATE TABLE #temp_dates(full_date DATE, day INT, month INT, year INT, week_of_year INT)"))
+                ti.log.info(f"Loading {len(date_records)} dates into temp table")
+                date_records.to_sql('#temp_dates',connection,if_exists= 'append',index= False,method='multi',chunksize= 1000)
+                existing_check = text("""SELECT COUNT(*)
+                                      FROM dim_date 
+                                      WHERE full_date in (SELECT full_date FROM #temp_dates)""")
+                existing_count = connection.execute(existing_check).scalar()
+                ti.log.info(f"Found {existing_count} existing dates in dim_date")
+
+                connection.execute(text("""MERGE INTO  dim_date AS target
+                                        using #temp_dates AS source
+                                        on target.full_date = source.full_date
+                                        WHEN NOT MATCHED THEN
+                                                INSERT (full_date, day, month, year, week_of_year)
+                                                VALUES (source.full_date, source.day, source.month, source.year, source.week_of_year);
+                                        
+                                        """))     
+                connection.execute(text("DROP TABLE #temp_dates"))
+
+                #--- locaation dim
+                locations = df[['country', 'province', 'lat', 'long']].copy()
+
+                locations['country'] = locations['country'].str.upper().str.strip()
+                locations['province'] = locations['province'].str.upper().str.strip()
+                locations['lat'] = locations['lat'].round(6).replace(0, None)  # Replace 0 with NULL
+                locations['long'] = locations['long'].round(6).replace(0, None)
+
+                locations['coord_priority'] = locations.apply(
+            lambda x: 0 if (x['lat'] == 0 and x['long'] == 0) else 1,
+            axis=1
+        )
+                
+                
+
+                locations = locations.sort_values(
+                        ['country', 'province', 'coord_priority'],
+                          ascending=[True, True, False])
+                
+                locations = locations.drop_duplicates(
+                 subset=[
+                         'country'.str.strip().str.lower(), 
+                        'province'.str.strip().str.lower()
+                        ], 
+                        keep='first'
+                )
+
+                locations['country'] = locations['country'].str.title()
+                locations['province'] = locations['province'].str.title()
+
+
+                
+
+                dupes_in_pandas = locations.duplicated(subset=['country', 'province']).sum()
+                if dupes_in_pandas > 0:
+                        ti.log.error(f"Found {dupes_in_pandas} duplicates after Pandas deduplication")
+                        sample_dupes = locations[locations.duplicated(subset=['country', 'province'], keep=False)]
+                        ti.log.error(f"Sample duplicates:\n{sample_dupes.head(5)}")
+                        raise ValueError("Duplicate country-province pairs exist in cleaned data")
+                
+                locations = locations[['country', 'province', 'lat', 'long']]
+
+                
+
+                
+
+                
+                connection.execute(text("ALTER INDEX UQ_location ON dim_location DISABLE"))
+
+                connection.execute(text("""CREATE TABLE #temp_locations( country VARCHAR(255)   ,
+                                                                                province VARCHAR(255) ,
+                                                                                lat DECIMAL(9,6),
+                                                                                [long] DECIMAL(9,6))
+                                                """))
+  
+        
+                metadata = MetaData()
+                temp_table = Table(
+                '#temp_locations', metadata,
+                Column('country', String(255)),
+                Column('province', String(255)),
+                Column('lat', DECIMAL(9,6)),
+                Column('long', DECIMAL(9,6)),
+                prefixes=['#']  # Marks this as a temp table
+                )
+
+
+                data = locations.to_dict('records')
+
+               
+                chunk_size = 1000
+                for i in range(0, len(data), chunk_size):
+                        chunk = data[i:i+chunk_size]
+                        connection.execute(temp_table.insert(), chunk)
+
+
+                dupe_check =text("""SELECT country , province, count(*)
+                                         FROM #temp_locations
+                                         GROUP BY country , province
+                                         HAVING count(*) > 1
+                                         """)
+                dupes = connection.execute(dupe_check).fetchall()
+                if dupes:
+                        connection.execute(text("DROP TABLE #temp_locations"))
+                        raise ValueError(f"Title-case duplicates found: {dupes}")
+                
+                connection.execute(text("""
+                        WITH CTE AS (
+                                SELECT *, 
+                                ROW_NUMBER() OVER (
+                                        PARTITION BY country, province 
+                                        ORDER BY (CASE WHEN lat != 0 AND [long] != 0 THEN 2
+                                                WHEN lat != 0 OR [long] != 0 THEN 1
+                                                ELSE 0 END) DESC
+                                ) AS rn
+                                FROM #temp_locations
+                        )
+                        DELETE FROM CTE WHERE rn > 1
+                        """))
+                
+
+
+                connection.execute(text("""MERGE INTO dim_location As target
+                                                USING #temp_locations AS source
+                                                ON target.country = source.country 
+                                                AND target.province = source.province 
+                                                WHEN MATCHED  AND (
+                                                        (source.lat <> 0 and source.lat <> target.lat) 
+                                        
+                                                        OR
+                                        
+                                                        (source.[long] <> 0 and source.[long] <> target.[long])
+                                                         ) THEN
+                                                                UPDATE SET
+                                                                        lat = COALESCE(NULLIF(source.lat, 0), target.lat),
+                                                                        [long] = COALESCE(NULLIF(source.[long], 0), target.[long])
+                                                 WHEN NOT MATCHED THEN
+                                                        INSERT (country, province, lat, [long])
+                                                        VALUES (source.country, source.province, source.lat, source.[long]);
+        
+                                                """))
+      
+                connection.execute(text("ALTER INDEX UQ_location ON dim_location REBUILD"))
+                connection.execute(text("DROP TABLE #temp_locations"))
+        ti.log.info(f"Successfully loaded {len(date_records)} dates and {len(locations)} locations")
+
+                
+
+                        
+
+
+def load_facts(**context):
+        ti = context['ti']
+        engine = create_engine(MSSQL_CONN_STR,fast_executemany=True)
+        
+        clean_data = ti.xcom_pull(task_ids='clean_transform_data')
+        if not clean_data:
+                raise AirflowSkipException('No clean data')
+        
+        df = pd.read_json(clean_data)
+ 
+        
+        # Convert 'date' to datetime
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        
+        # Read date map with explicit type
+        try:
+                date_map = pd.read_sql("SELECT date_id, full_date FROM dbo.dim_date", engine)
+                date_map['full_date'] = pd.to_datetime(date_map['full_date']).dt.date
+                loc_map = pd.read_sql("SELECT location_id, country, province FROM dbo.dim_location", engine)
+        except Exception as e:
+                 ti.log.error("Dimension tables missing! Run dimension pipeline first")
+                 raise
+
+        
+        # Merge with proper types
+        fact_df = df.merge(
+        date_map, 
+        left_on='date', 
+        right_on='full_date',
+        how = 'inner')
+
+        ti.log.info(f"After date merge: {len(fact_df)} records")
+
+        fact_df = fact_df.merge(loc_map,on = ['country', 'province'],how='inner')
+        
+        ti.log.info(f"After location merge: {len(fact_df)} records")
+
+        fact_df = fact_df[['date_id', 'location_id', 'Confirmed', 'Deaths', 'Recovered']]
+        fact_df = fact_df.rename(columns={
+        'Confirmed': 'confirmed',
+        'Deaths': 'deaths',
+        'Recovered': 'recovered'
+    })
+        
+        fact_df = fact_df.dropna(subset=['date_id'])
+
+        fact_df['date_id'] = fact_df['date_id'].astype(int)
+        fact_df['location_id'] = fact_df['location_id'].astype(int)
+        for col in ['confirmed', 'deaths', 'recovered']:
+                fact_df[col] = fact_df[col].fillna(0).astype(int)
+
+        fact_df = fact_df.groupby(['date_id','location_id'],as_index = False,).agg({
+                'confirmed' : 'max',
+                'deaths'  : 'max',
+                'recovered' : 'max'
+        })
+
+        ti.log.info(f"Final fact data shape: {fact_df.shape}")
+        if fact_df.empty:
+                raise AirflowSkipException("No data to load into fact_covid_cases")
+        
+
+
+        with engine.begin() as connection:
+
+                connection.execute(text("""
+              
+            CREATE TABLE #temp_facts (
+                date_id INT NOT NULL,
+                location_id INT NOT NULL,
+                confirmed INT ,
+                deaths INT ,
+                recovered INT 
+            )
+        """))
+                
+               
+        # Insert data
+       
+          # Define temp table manually
+                metadata = MetaData()
+                temp_table = Table(
+                        '#temp_facts', metadata,
+                        Column('date_id', Integer, nullable=False),
+                        Column('location_id', Integer, nullable=False),
+                        Column('confirmed', Integer),
+                        Column('deaths', Integer),
+                        Column('recovered', Integer)
+                )
+
+                # Insert data in chunks
+                data = fact_df.to_dict('records')
+                chunk_size = 500
+                for i in range(0, len(data), chunk_size):
+                        chunk = data[i:i + chunk_size]
+                        connection.execute(temp_table.insert(), chunk)
+
+                dup_check = connection.execute(text("""
+                SELECT date_id, location_id, COUNT(*) 
+                FROM #temp_facts 
+                GROUP BY date_id, location_id 
+                HAVING COUNT(*) > 1
+            """)).fetchall()
+                
+                if dup_check:
+                        ti.log.error(f"duplicates rows detected{dup_check}")
+                        raise ValueError("duplicates rows in temp table")
+
+                connection.execute(text(""" MERGE INTO fact_covid_cases  AS target
+                                  USING (SELECT DISTINCT date_id,location_id,confirmed,deaths,recovered
+                                        FROM #temp_facts) AS source
+                                  ON source.date_id = target.date_id AND
+                                  source.location_id = target.location_id
+                                  WHEN MATCHED AND (
+                                        target.confirmed <> source.confirmed
+                                        OR target.deaths <> source.deaths
+                                        OR target.recovered <> source.recovered
+                                  ) THEN
+                                  UPDATE SET 
+                                        target.confirmed = source.confirmed,
+                                        target.deaths = source.deaths,
+                                        target.recovered = source.recovered
+                                  WHEN NOT MATCHED THEN
+                                  INSERT(date_id, location_id, confirmed, deaths, recovered)
+                                  VALUES (source.date_id, source.location_id, 
+                                  source.confirmed, source.deaths, source.recovered);"""))
+                
+                
+                
+                
+
+
+
+
+                
+                
+with DAG('Covid_analytics',default_args=default_args,
+    schedule_interval='0 3 * * *',
+
+    end_date=datetime(2023, 3, 30),  # Daily at 3am
+    catchup=True,
+    max_active_tasks = 1
+    ) as dag:
+        
+        create_table = MsSqlOperator(
+        task_id = 'create_table',
+        mssql_conn_id = 'mssql_default',
+         sql=SCHEMA_SQL)
+    
+        fetch_dataa = PythonOperator(
+        task_id = 'fetch_data',
+        python_callable = fetch_data,
+        op_kwargs={"context": "{{ execution_date }}"}
+         )
+
+        clean_data = PythonOperator(
+                task_id = 'clean_transform_data',
+                python_callable = clean_transform_data,
+                op_kwargs={"context": "{{ execution_date }}"}
+                )
+
+        load_dim = PythonOperator(task_id = 'load_dimensions',
+                                python_callable = load_dimensions,
+                                op_kwargs={"context": "{{ execution_date }}"})
+
+        load_fact=  PythonOperator(task_id = 'load_facts',
+                                python_callable = load_facts,
+                                op_kwargs={"context": "{{ execution_date }}"})
+
+    
+
+
+create_table >> fetch_dataa >> clean_data >> load_dim >> load_fact
+
+
+
+
+
+
