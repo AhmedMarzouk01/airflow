@@ -17,8 +17,7 @@ This project demonstrates how to efficiently process over 4 million rows of pand
 📊 Project Architecture
 🔁 Workflow of the Airflow DAG
 pgsql
-Copy
-Edit
+
             +--------------------------+
             | Start DAG Execution       |
             +-----------+--------------+
@@ -55,7 +54,9 @@ Edit
             +--------------------------+
             | DAG Execution Complete    |
             +--------------------------+
-🛠️ Tech Stack & Tools
+
+
+#🛠️ Tech Stack & Tools
 Category	Technology Used
 Orchestration	Apache Airflow
 Data Extraction	Python (requests, pandas)
@@ -63,20 +64,10 @@ Database	Microsoft SQL Server
 Database ORM	SQLAlchemy
 Programming Language	Python
 Task Scheduling	Airflow DAGs
-📂 Project Structure
-plaintext
-Copy
-Edit
-Covid19-Airflow-Pipeline/
-│-- dags/
-│   ├── covid_analytics_dag.py  # Airflow DAG script
-│-- sql/
-│   ├── schema.sql  # SQL schema for the database
-│-- config/
-│   ├── airflow_settings.py  # Airflow configurations
-│-- README.md  # Project documentation
-│-- requirements.txt  # Required Python packages
-│-- .gitignore  # Git ignored files
+
+
+
+│
 📝 Detailed ETL Process
 1️⃣ Database Schema Creation (SCHEMA_SQL)
 Creates three tables:
