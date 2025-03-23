@@ -9,18 +9,17 @@ from io import StringIO
 from sqlalchemy import create_engine, text,MetaData,Table,Column, Integer, String, DECIMAL
 
 default_args = {
-    'owner':'Ahmed',
+    'owner':'Ahmed_marzouk',
     'depends_on_past': False,
     'start_date': datetime(2020,1,20),
     'end_date': datetime(2023, 3, 30),  # Add this line
     'retries':3,
-    'retry_delay': timedelta(minutes=5),
-    'max_active_tasks': 1,
+    'retry_delay': timedelta(minutes=5)
 }
 
 MSSQL_CONN_STR = (
     "mssql+pyodbc://airflow_user:5658545212@"
-    "192.168.1.6\\SQLEXPRESS/Covid2?"
+    ".\\SQLEXPRESS/Covid2?"
     "driver=ODBC+Driver+18+for+SQL+Server&"
     "TrustServerCertificate=yes&"
     "Encrypt=no&"
@@ -58,7 +57,7 @@ COUNTRY_MAPPING = {
 }
 
 SCHEMA_SQL = """
-USE Covid;  -- Ensure we're in the correct database
+USE Covid2;  -- Ensure we're in the correct database
 
 
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'dim_date' AND schema_id = SCHEMA_ID('dbo'))
@@ -78,9 +77,7 @@ BEGIN
     CREATE TABLE dbo.dim_location (
         location_id INT IDENTITY(1,1) PRIMARY KEY,
         country VARCHAR(255) NOT NULL,
-        lat DECIMAL(9,6) NULL,
-        long DECIMAL(9,6) NULL,
-        CONSTRAINT UQ_location UNIQUE (country, province)
+        CONSTRAINT UQ_location UNIQUE (country)
     );
 END
 
@@ -102,30 +99,16 @@ END
 def standarize_column_names(df):
 
         column_map = {
-        'Province/State': 'province',
         'Country/Region': 'country',
         'Country_Region': 'country',
         'Last Update': 'Last_Update',
         'Last_Update': 'Last_Update',
-        'Latitude': 'lat',
-        'Lat': 'lat',
-        'Longitude': 'long',
-        'Long_': 'long',
         'Confirmed': 'Confirmed',
         'Deaths': 'Deaths',
         'Recovered': 'Recovered'
     }
 
         df = df.rename(columns = {k :v for k,v in column_map.items() if k in df.columns})
-
-        if 'province' not in df.columns and 'Combined_Key' in df.columns:
-
-                df['province'] = df['Combined_Key'].str.split(', ').str[-2]
-
-        if 'lat' not in df.columns:
-                df['lat'] = 0.0
-        if 'long' not in df.columns:
-                df['long'] = 0.0
 
 
         return df
@@ -175,40 +158,26 @@ def clean_transform_data(**context):
         df['country'] = df['country'].replace(COUNTRY_MAPPING)
 
         df['country'] = df['country'].str.strip().str.title().str.replace(' Of ', ' of ')
-        df['province'] = df['province'].str.strip().str.title().str.replace(' Of ', ' of ')
 
         df['country'] = df['country'].fillna('unknown')
         df['country'] = df['country'].replace('', 'unknown')
-
-        df['province'] = df['province'].replace('', 'unknown')
-
-        df['province'] = df['province'].fillna('unknown')
-
+        clean_df = df.groupby(['date','country'],as_index= False).agg({
+                'Confirmed' : 'sum',
+                'Deaths' : 'sum',
+                'Recovered' : 'sum'
+        })
 
         metrics = ['Confirmed', 'Deaths', 'Recovered']
 
         df[metrics] = df[metrics].fillna(0).clip(lower = 0)
 
-        location_columns= ['lat','long']
-        
-        for col in location_columns:
-                if col not in df.columns:
-                        context['ti'].log.warning(f"creating missing columns: {col}")
-                        df[col] = 0.0
-        df[location_columns] = df[location_columns].astype(float)
 
-        df[location_columns] = df[location_columns].fillna(0)
-
-        df['lat'] = df['lat'].clip(-90, 90)
-        df['long'] = df['long'].clip(-180, 180)
-
-        clean_df = df[['date', 'country', 'province', 'lat', 'long', 'Confirmed', 'Deaths', 'Recovered']]
 
         return clean_df.to_json(date_format='iso')
 
 def load_dimensions(**context):
         ti = context['ti']
-        engine = create_engine(MSSQL_CONN_STR,fast_executemany=False)
+        engine = create_engine(MSSQL_CONN_STR,fast_executemany=True)
 
         clean_data = ti.xcom_pull(task_ids = 'clean_transform_data')
 
@@ -253,128 +222,61 @@ def load_dimensions(**context):
                 connection.execute(text("DROP TABLE #temp_dates"))
 
                 #--- locaation dim
-                locations = df[['country', 'province', 'lat', 'long']].copy()
+                locations = df[['country']].copy()
 
                 locations['country'] = locations['country'].str.upper().str.strip()
-                locations['province'] = locations['province'].str.upper().str.strip()
-                locations['lat'] = locations['lat'].round(6).replace(0, None)  # Replace 0 with NULL
-                locations['long'] = locations['long'].round(6).replace(0, None)
-
-                locations['coord_priority'] = locations.apply(
-            lambda x: 0 if (x['lat'] == 0 and x['long'] == 0) else 1,
-            axis=1
-        )
                 
                 
 
-                locations = locations.sort_values(
-                        ['country', 'province', 'coord_priority'],
-                          ascending=[True, True, False])
-                
-                locations = locations.drop_duplicates(
-                 subset=[
-                         'country'.str.strip().str.lower(), 
-                        'province'.str.strip().str.lower()
-                        ], 
-                        keep='first'
-                )
+                locations = locations.drop_duplicates()
 
                 locations['country'] = locations['country'].str.title()
-                locations['province'] = locations['province'].str.title()
+
 
 
                 
 
-                dupes_in_pandas = locations.duplicated(subset=['country', 'province']).sum()
+                dupes_in_pandas = locations.duplicated(subset=['country']).sum()
                 if dupes_in_pandas > 0:
                         ti.log.error(f"Found {dupes_in_pandas} duplicates after Pandas deduplication")
-                        sample_dupes = locations[locations.duplicated(subset=['country', 'province'], keep=False)]
+                        sample_dupes = locations[locations.duplicated(subset=['country'], keep=False)]
                         ti.log.error(f"Sample duplicates:\n{sample_dupes.head(5)}")
                         raise ValueError("Duplicate country-province pairs exist in cleaned data")
                 
-                locations = locations[['country', 'province', 'lat', 'long']]
+                locations = locations[['country']]
 
                 
 
-                
-
-                
-                connection.execute(text("ALTER INDEX UQ_location ON dim_location DISABLE"))
-
-                connection.execute(text("""CREATE TABLE #temp_locations( country VARCHAR(255)   ,
-                                                                                province VARCHAR(255) ,
-                                                                                lat DECIMAL(9,6),
-                                                                                [long] DECIMAL(9,6))
-                                                """))
-  
-        
-                metadata = MetaData()
-                temp_table = Table(
-                '#temp_locations', metadata,
-                Column('country', String(255)),
-                Column('province', String(255)),
-                Column('lat', DECIMAL(9,6)),
-                Column('long', DECIMAL(9,6)),
-                prefixes=['#']  # Marks this as a temp table
-                )
 
 
-                data = locations.to_dict('records')
+                connection.execute(text("""
+                        CREATE TABLE #temp_locations (
+                                country VARCHAR(255) COLLATE SQL_Latin1_General_CP1_CI_AS
+                        );
+                        """))
 
-               
-                chunk_size = 1000
-                for i in range(0, len(data), chunk_size):
-                        chunk = data[i:i+chunk_size]
-                        connection.execute(temp_table.insert(), chunk)
+                locations.to_sql('#temp_locations',connection,index = False,if_exists = 'append',chunksize= 1000)
 
-
-                dupe_check =text("""SELECT country , province, count(*)
+                dupe_check =text("""SELECT country, count(*)
                                          FROM #temp_locations
-                                         GROUP BY country , province
+                                         GROUP BY country 
                                          HAVING count(*) > 1
                                          """)
                 dupes = connection.execute(dupe_check).fetchall()
                 if dupes:
                         connection.execute(text("DROP TABLE #temp_locations"))
                         raise ValueError(f"Title-case duplicates found: {dupes}")
-                
-                connection.execute(text("""
-                        WITH CTE AS (
-                                SELECT *, 
-                                ROW_NUMBER() OVER (
-                                        PARTITION BY country, province 
-                                        ORDER BY (CASE WHEN lat != 0 AND [long] != 0 THEN 2
-                                                WHEN lat != 0 OR [long] != 0 THEN 1
-                                                ELSE 0 END) DESC
-                                ) AS rn
-                                FROM #temp_locations
-                        )
-                        DELETE FROM CTE WHERE rn > 1
-                        """))
-                
-
-
-                connection.execute(text("""MERGE INTO dim_location As target
-                                                USING #temp_locations AS source
-                                                ON target.country = source.country 
-                                                AND target.province = source.province 
-                                                WHEN MATCHED  AND (
-                                                        (source.lat <> 0 and source.lat <> target.lat) 
-                                        
-                                                        OR
-                                        
-                                                        (source.[long] <> 0 and source.[long] <> target.[long])
-                                                         ) THEN
-                                                                UPDATE SET
-                                                                        lat = COALESCE(NULLIF(source.lat, 0), target.lat),
-                                                                        [long] = COALESCE(NULLIF(source.[long], 0), target.[long])
-                                                 WHEN NOT MATCHED THEN
-                                                        INSERT (country, province, lat, [long])
-                                                        VALUES (source.country, source.province, source.lat, source.[long]);
         
-                                                """))
-      
-                connection.execute(text("ALTER INDEX UQ_location ON dim_location REBUILD"))
+                
+
+                connection.execute(text("""
+            MERGE INTO dim_location AS target
+            USING #temp_locations AS source
+            ON target.country = source.country COLLATE SQL_Latin1_General_CP1_CI_AS
+            WHEN NOT MATCHED THEN 
+                INSERT (country) VALUES (source.country);
+        """))
+
                 connection.execute(text("DROP TABLE #temp_locations"))
         ti.log.info(f"Successfully loaded {len(date_records)} dates and {len(locations)} locations")
 
@@ -401,7 +303,7 @@ def load_facts(**context):
         try:
                 date_map = pd.read_sql("SELECT date_id, full_date FROM dbo.dim_date", engine)
                 date_map['full_date'] = pd.to_datetime(date_map['full_date']).dt.date
-                loc_map = pd.read_sql("SELECT location_id, country, province FROM dbo.dim_location", engine)
+                loc_map = pd.read_sql("SELECT location_id, country FROM dbo.dim_location", engine)
         except Exception as e:
                  ti.log.error("Dimension tables missing! Run dimension pipeline first")
                  raise
@@ -416,16 +318,18 @@ def load_facts(**context):
 
         ti.log.info(f"After date merge: {len(fact_df)} records")
 
-        fact_df = fact_df.merge(loc_map,on = ['country', 'province'],how='inner')
+        fact_df = fact_df.merge(loc_map,on = ['country'],how='inner')
         
         ti.log.info(f"After location merge: {len(fact_df)} records")
 
         fact_df = fact_df[['date_id', 'location_id', 'Confirmed', 'Deaths', 'Recovered']]
+        # After merging data:
         fact_df = fact_df.rename(columns={
         'Confirmed': 'confirmed',
         'Deaths': 'deaths',
         'Recovered': 'recovered'
-    })
+        })
+ 
         
         fact_df = fact_df.dropna(subset=['date_id'])
 
@@ -434,11 +338,7 @@ def load_facts(**context):
         for col in ['confirmed', 'deaths', 'recovered']:
                 fact_df[col] = fact_df[col].fillna(0).astype(int)
 
-        fact_df = fact_df.groupby(['date_id','location_id'],as_index = False,).agg({
-                'confirmed' : 'max',
-                'deaths'  : 'max',
-                'recovered' : 'max'
-        })
+        fact_df  = fact_df.drop_duplicates(subset = ['date_id','location_id'])
 
         ti.log.info(f"Final fact data shape: {fact_df.shape}")
         if fact_df.empty:
@@ -475,7 +375,7 @@ def load_facts(**context):
 
                 # Insert data in chunks
                 data = fact_df.to_dict('records')
-                chunk_size = 500
+                chunk_size = 2000
                 for i in range(0, len(data), chunk_size):
                         chunk = data[i:i + chunk_size]
                         connection.execute(temp_table.insert(), chunk)
@@ -524,7 +424,7 @@ with DAG('Covid_analytics',default_args=default_args,
 
     end_date=datetime(2023, 3, 30),  # Daily at 3am
     catchup=True,
-    max_active_tasks = 1
+
     ) as dag:
         
         create_table = MsSqlOperator(
@@ -556,6 +456,13 @@ with DAG('Covid_analytics',default_args=default_args,
 
 
 create_table >> fetch_dataa >> clean_data >> load_dim >> load_fact
+
+
+
+
+
+
+
 
 
 
